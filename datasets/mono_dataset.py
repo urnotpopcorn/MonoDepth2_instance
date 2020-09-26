@@ -7,23 +7,18 @@
 from __future__ import absolute_import, division, print_function
 
 import os
+import time
 import random
 import numpy as np
 import copy
 from PIL import Image  # using pillow-simd for increased speed
+from PIL import ImageCms
+import PIL.Image as pil
 
 import torch
 import torch.utils.data as data
 from torchvision import transforms
-
-
-def pil_loader(path):
-    # open path as file to avoid ResourceWarning
-    # (https://github.com/python-pillow/Pillow/issues/835)
-    with open(path, 'rb') as f:
-        with Image.open(f) as img:
-            return img.convert('RGB')
-
+import torchvision
 
 class MonoDataset(data.Dataset):
     """Superclass for monocular dataloaders
@@ -46,7 +41,9 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg'):
+                 img_ext='.jpg',
+                 opt=None,
+                 mode=None):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -61,8 +58,18 @@ class MonoDataset(data.Dataset):
         self.is_train = is_train
         self.img_ext = img_ext
 
-        self.loader = pil_loader
+        self.loader = self.pil_loader
         self.to_tensor = transforms.ToTensor()
+
+        self.opt = opt
+        self.mode = mode
+
+        # project_dir = "/userhome/34/h3567721/monodepth-project" or "/local/xjqi/monodepth-project"
+        if self.opt.instance_pose:
+            #self.data_bbox_path = os.path.join(self.opt.project_dir, "dataset", "kitti_data_bbox_eigen_zhou", self.mode)
+            self.data_bbox_path = os.path.join(self.opt.project_dir, "monodepth2", "kitti_data_bbox_eigen_zhou", self.mode)
+            #self.data_ins_path = os.path.join(self.opt.project_dir, "dataset", "kitti_data_ins_eigen_zhou", self.mode)
+            self.data_ins_path = os.path.join(self.opt.project_dir, "monodepth2", "kitti_data_ins_eigen_zhou", self.mode)
 
         # We need to specify augmentations differently in newer versions of torchvision.
         # We first try the newer tuple version; if this fails we fall back to scalars
@@ -105,8 +112,38 @@ class MonoDataset(data.Dataset):
             f = inputs[k]
             if "color" in k:
                 n, im, i = k
+                # PILLOW image: [W,H], [0,255] -> [C, H, W], [0,1] torch.FloadTensor；
                 inputs[(n, im, i)] = self.to_tensor(f)
                 inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+    
+        if self.opt.instance_pose:
+            K_num = 5 # only K obj instances are included, K=4, K+1(bg)=K_num
+            for k in list(inputs):
+                if "ins_id_seg" in k:
+                    f = inputs[k]
+                    n, im, i = k
+                    max_num = int(np.max(f))
+                    ins_tensor = torch.Tensor(np.asarray(f))
+                    if max_num+1 <= K_num:
+                        ins_tensor_one_hot = torch.nn.functional.one_hot(ins_tensor.to(torch.int64), K_num).type(torch.bool)
+                    else:
+                        ins_tensor_one_hot = torch.nn.functional.one_hot(ins_tensor.to(torch.int64), max_num+1).type(torch.bool)
+
+                    ins_tensor_one_hot = ins_tensor_one_hot[:,:,:K_num]
+
+                    inputs[(n, im, 0)] = ins_tensor_one_hot.permute(2,0,1)
+
+                    # shape: [K+1, 192, 640], 
+                    # background mask : [0, :, :]
+                    # instance 1 mask : [1, :, :]
+                    # instance 2 mask : [2, :, :] ...... K in total, dtype in boolean
+
+    def pil_loader(self, path):
+        # open path as file to avoid ResourceWarning
+        # (https://github.com/python-pillow/Pillow/issues/835)
+        with open(path, 'rb') as f:
+            with Image.open(f) as img:
+                return img.convert('RGB')
 
     def __len__(self):
         return len(self.filenames)
@@ -137,28 +174,61 @@ class MonoDataset(data.Dataset):
         """
         inputs = {}
 
+        # only do augmentation in train mode
         do_color_aug = self.is_train and random.random() > 0.5
         do_flip = self.is_train and random.random() > 0.5
-
-        line = self.filenames[index].split()
-        folder = line[0]
+    
+        # ['2011_09_26/2011_09_2..._0028_sync', '268', 'l']
+        line = self.filenames[index].split() 
+        folder = line[0]  # '2011_09_26/2011_09_26_drive_0028_sync'
 
         if len(line) == 3:
-            frame_index = int(line[1])
+            frame_index = int(line[1]) # 268
         else:
             frame_index = 0
 
         if len(line) == 3:
-            side = line[2]
+            side = line[2] # l
         else:
             side = None
 
-        for i in self.frame_idxs:
-            if i == "s":
-                other_side = {"r": "l", "l": "r"}[side]
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
-            else:
+        for i in self.frame_idxs: # [0,1,-1]
+            try:
                 inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+            except FileNotFoundError as fnf_error:
+                # if the frame_index = 0, there is no -1 file, so pick the 0
+                # out the rame_index+i is out of range, also pick the frame_index
+                # print(fnf_error)
+                inputs[("color", i, -1)] = self.get_color(folder, frame_index, side, do_flip)
+
+        if self.opt.instance_pose:
+            for i in self.frame_idxs: # [0,1,-1]
+                try:
+                    ins_seg = self.get_sem_ins(self.data_ins_path, folder, frame_index + i, side, do_flip)
+                except FileNotFoundError as fnf_error:
+                    # print(fnf_error)
+                    ins_seg = self.get_sem_ins(self.data_ins_path, folder, frame_index, side, do_flip)
+
+                sig_ins_id_seg = Image.fromarray(np.uint8(ins_seg[:,:,1])).convert("L")
+                ins_width, ins_height = sig_ins_id_seg.size
+                
+                sig_ins_id_seg = sig_ins_id_seg.resize((self.opt.width, self.opt.height), Image.NEAREST)
+                inputs[("ins_id_seg", i, -1)] = sig_ins_id_seg
+
+                ratio_w = self.opt.width / ins_width
+                ratio_h = self.opt.height / ins_height
+
+                try:
+                    ins_RoI_bbox = self.get_ins_bbox(self.data_bbox_path, folder, frame_index + i, side, 
+                        ratio_w, ratio_h, self.opt.width, self.opt.height, do_flip)
+                except FileNotFoundError as fnf_error:
+                    # if the frame_index = 0, there is no -1 file, so pick the frame_index
+                    # out the rame_index+i is out of range, also pick the frame_index
+                    # print(fnf_error)
+                    ins_RoI_bbox = self.get_ins_bbox(self.data_bbox_path, folder, frame_index, side, 
+                        ratio_w, ratio_h, self.opt.width, self.opt.height, do_flip)   
+
+                inputs[("ins_RoI_bbox", i, 0)] = torch.Tensor(ins_RoI_bbox)
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
@@ -169,10 +239,12 @@ class MonoDataset(data.Dataset):
 
             inv_K = np.linalg.pinv(K)
 
-            inputs[("K", scale)] = torch.from_numpy(K)
-            inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
+            inputs[("K", scale)] = torch.from_numpy(K).float()
+            inputs[("inv_K", scale)] = torch.from_numpy(inv_K).float()
 
+        # https://pytorch.org/docs/stable/torchvision/transforms.html
         if do_color_aug:
+            # error in Lab mode, works in RGB mode
             color_aug = transforms.ColorJitter.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
         else:
@@ -180,22 +252,17 @@ class MonoDataset(data.Dataset):
 
         self.preprocess(inputs, color_aug)
 
-        for i in self.frame_idxs:
+        for i in self.frame_idxs: # [0,1,-1]
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
 
+            if self.opt.instance_pose:
+                del inputs[("ins_id_seg", i, -1)]
+        
         if self.load_depth:
             depth_gt = self.get_depth(folder, frame_index, side, do_flip)
             inputs["depth_gt"] = np.expand_dims(depth_gt, 0)
             inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
-
-        if "s" in self.frame_idxs:
-            stereo_T = np.eye(4, dtype=np.float32)
-            baseline_sign = -1 if do_flip else 1
-            side_sign = -1 if side == "l" else 1
-            stereo_T[0, 3] = side_sign * baseline_sign * 0.1
-
-            inputs["stereo_T"] = torch.from_numpy(stereo_T)
 
         return inputs
 
