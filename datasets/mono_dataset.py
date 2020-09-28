@@ -67,9 +67,9 @@ class MonoDataset(data.Dataset):
         # project_dir = "/userhome/34/h3567721/monodepth-project" or "/local/xjqi/monodepth-project"
         if self.opt.instance_pose:
             #self.data_bbox_path = os.path.join(self.opt.project_dir, "dataset", "kitti_data_bbox_eigen_zhou", self.mode)
-            self.data_bbox_path = os.path.join(self.opt.project_dir, "monodepth2", "kitti_data_bbox_eigen_zhou", self.mode)
+            self.data_bbox_path = os.path.join("kitti_data_bbox_eigen_zhou", self.mode)
             #self.data_ins_path = os.path.join(self.opt.project_dir, "dataset", "kitti_data_ins_eigen_zhou", self.mode)
-            self.data_ins_path = os.path.join(self.opt.project_dir, "monodepth2", "kitti_data_ins_eigen_zhou", self.mode)
+            self.data_ins_path = os.path.join("kitti_data_ins_eigen_zhou", self.mode)
 
         # We need to specify augmentations differently in newer versions of torchvision.
         # We first try the newer tuple version; if this fails we fall back to scalars
